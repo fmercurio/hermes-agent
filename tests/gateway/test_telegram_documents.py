@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
 )
+from gateway.session import SessionSource, build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +491,45 @@ class TestSendDocument:
 
 
 class TestTelegramPhotoBatching:
+    @pytest.mark.parametrize(
+        ("profile", "expected_namespace"),
+        [
+            ("pilot", "agent:pilot"),
+            (None, "agent:main"),
+        ],
+        ids=["routed-profile", "multiplexing-off"],
+    )
+    def test_photo_batch_key_preserves_session_namespace(
+        self,
+        adapter,
+        profile,
+        expected_namespace,
+    ):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100123",
+            chat_type="group",
+            user_id="user-1",
+            thread_id="42",
+            profile=profile,
+        )
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=source,
+            media_urls=["/tmp/screenshot.jpg"],
+            media_types=["image/jpeg"],
+        )
+
+        batch_key = adapter._photo_batch_key(
+            event,
+            SimpleNamespace(media_group_id=None),
+        )
+
+        expected_session_key = build_session_key(source, profile=source.profile)
+        assert batch_key == f"{expected_session_key}:photo-burst"
+        assert batch_key.startswith(f"{expected_namespace}:")
+
     @pytest.mark.asyncio
     async def test_flush_photo_batch_does_not_drop_newer_scheduled_task(self, adapter):
         old_task = MagicMock()

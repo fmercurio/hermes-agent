@@ -2799,6 +2799,51 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
+async def _resolve_prequeued_image_clarify(
+    adapter,
+    session_key: str,
+    clarify_id: str,
+    expected_event,
+) -> bool:
+    """Resolve a newly-opened clarify from an image queued in the same session.
+
+    A Telegram photo can arrive while the model is still deciding to call the
+    open-ended ``clarify`` tool.  The active-session guard queues that photo so
+    it does not interrupt the running turn.  Once the clarify is registered,
+    consume that exact session's queued image as the answer instead of leaving
+    the agent blocked behind its own pending follow-up. ``expected_event`` is
+    captured when the clarify opens; if another event has replaced the pending
+    slot before this coroutine runs, leave both the clarify and replacement
+    event untouched.
+    """
+    from tools import clarify_gateway as clarify_mod
+
+    entry = clarify_mod.get_pending_for_session(session_key)
+    if entry is None or entry.clarify_id != clarify_id or entry.choices:
+        return False
+
+    pending_messages = getattr(adapter, "_pending_messages", None)
+    if not isinstance(pending_messages, dict):
+        return False
+    if pending_messages.get(session_key) is not expected_event:
+        return False
+    event = expected_event
+    media_urls = getattr(event, "media_urls", None) or []
+    if event is None or not any(
+        _event_media_is_image(event, index) for index in range(len(media_urls))
+    ):
+        return False
+
+    parts = [(getattr(event, "text", None) or "").strip(), _build_media_placeholder(event)]
+    response = "\n\n".join(part for part in parts if part)
+    if not response or not clarify_mod.resolve_gateway_clarify(clarify_id, response):
+        return False
+
+    if pending_messages.get(session_key) is event:
+        pending_messages.pop(session_key, None)
+    return True
+
+
 def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
     """Context note prepended to a user turn when they attach a document.
 
@@ -5158,6 +5203,55 @@ class TurnRunner:
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
             )
+
+            # A photo can reach the active-session queue while the model is
+            # still deciding to ask an open-ended clarify. Reconcile that
+            # already-arrived image on the gateway loop before rendering a
+            # redundant prompt; the resolved entry then returns immediately
+            # through the normal wait/cleanup primitive.
+            if not choices:
+                _pending_messages = getattr(
+                    ctx._status_adapter,
+                    "_pending_messages",
+                    None,
+                )
+                _queued_image_event = (
+                    _pending_messages.get(ctx.session_key or "")
+                    if isinstance(_pending_messages, dict)
+                    else None
+                )
+                _queued_image_fut = safe_schedule_threadsafe(
+                    _resolve_prequeued_image_clarify(
+                        ctx._status_adapter,
+                        ctx.session_key or "",
+                        clarify_id,
+                        _queued_image_event,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Prequeued clarify image reconciliation failed to schedule",
+                )
+                if _queued_image_fut is not None:
+                    try:
+                        if _queued_image_fut.result(timeout=3):
+                            response = _clarify_mod.wait_for_response(
+                                clarify_id,
+                                timeout=1.0,
+                            )
+                            return response or ""
+                    except TimeoutError:
+                        # Do not let a loop-stalled reconciliation consume the
+                        # image after we fall back to rendering the prompt.
+                        _queued_image_fut.cancel()
+                        logger.debug(
+                            "Prequeued clarify image reconciliation timed out",
+                            exc_info=True,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Prequeued clarify image reconciliation failed",
+                            exc_info=True,
+                        )
 
             # Pause typing — like approval, we don't want a "thinking..."
             # status to obscure the prompt or block the user from typing
@@ -16627,9 +16721,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _prepare_clarify_reply_text(self, event) -> str:
-        """Return raw text or successful voice transcripts for a clarify reply."""
+        """Return text, media paths, or successful voice transcripts for a clarify reply."""
         if not self._pending_event_audio_paths(event):
-            return (event.text or "").strip()
+            parts = [(event.text or "").strip()]
+            if getattr(event, "media_urls", None):
+                parts.append(_build_media_placeholder(event))
+            return "\n\n".join(part for part in parts if part)
 
         _, successful_transcripts = await self._transcribe_pending_audio_event_once(
             event, "",
