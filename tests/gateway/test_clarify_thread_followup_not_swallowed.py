@@ -34,6 +34,8 @@ from gateway.session import SessionSource
 
 
 SESSION_KEY = "agent:main:slack:dm:D123:1111.2222"
+MAIN_TELEGRAM_SESSION_KEY = "agent:main:telegram:group:-100123:42"
+PROFILE_SESSION_KEY = "agent:pilot:telegram:group:-100123:42"
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -81,14 +83,14 @@ def _clear_clarify_state():
         cm._notify_cbs.clear()
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, session_key=SESSION_KEY):
     from gateway.run import GatewayRunner
 
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._startup_restore_in_progress = False
     runner._scale_to_zero_note_real_inbound = lambda: None
     runner._is_user_authorized = lambda source: True
-    runner._session_key_for_source = lambda source: SESSION_KEY
+    runner._session_key_for_source = lambda source: session_key
     runner._adapter_for_source = lambda source: adapter
     runner._update_prompt_pending = {}
     return runner
@@ -150,6 +152,52 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     assert entry is not None
     assert entry.event.is_set()
     assert entry.response == "a carousel actually"
+    _clear_clarify_state()
+
+
+@pytest.mark.parametrize(
+    ("profile", "session_key"),
+    [
+        ("pilot", PROFILE_SESSION_KEY),
+        (None, MAIN_TELEGRAM_SESSION_KEY),
+    ],
+    ids=["routed-profile", "multiplexing-off"],
+)
+@pytest.mark.asyncio
+async def test_image_resolves_open_ended_clarify_with_media_path(profile, session_key):
+    """A screenshot clarify answer works with and without multiplex routing."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter, session_key)
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100123",
+            chat_type="group",
+            user_id="user-1",
+            thread_id="42",
+            profile=profile,
+        ),
+        media_urls=["/tmp/screenshot.jpg"],
+        media_types=["image/jpeg"],
+        message_id="image-msg",
+    )
+    entry = cm.register(
+        "cl-image",
+        session_key,
+        "Send a screenshot of the visible options",
+        None,
+    )
+
+    result = await _dispatch(runner, event)
+
+    assert result == ""
+    assert entry.event.is_set()
+    assert entry.response == "[User sent an image: /tmp/screenshot.jpg]"
     _clear_clarify_state()
 
 

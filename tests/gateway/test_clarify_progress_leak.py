@@ -14,12 +14,19 @@ import importlib
 import sys
 import time
 import types
+from typing import Callable
+from unittest.mock import MagicMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.session import SessionSource
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.session import SessionSource, build_session_key
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -76,6 +83,34 @@ class ClarifyThenToolAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+class PrequeuedImageClarifyAgent:
+    """Asks for an image after that image has already reached the busy queue."""
+
+    last_clarify_response = None
+    clarify_callback: Callable[[str, object | None], str]
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        response = self.clarify_callback("Send a screenshot", None)
+        type(self).last_clarify_response = response
+        return {"final_response": "received screenshot", "messages": [], "api_calls": 1}
+
+
+class OpenEndedClarifyAgent:
+    """Asks an open-ended question without a prequeued response."""
+
+    clarify_callback: Callable[[str, object | None], str]
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.clarify_callback("Send a screenshot", None)
+        return {"final_response": "continued", "messages": [], "api_calls": 1}
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -99,7 +134,7 @@ def _make_runner(adapter):
     return runner
 
 
-def _install_fakes(monkeypatch, mode):
+def _install_fakes(monkeypatch, mode, agent_cls=ClarifyThenToolAgent):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", mode)
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -107,7 +142,7 @@ def _install_fakes(monkeypatch, mode):
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = ClarifyThenToolAgent
+    fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 — register terminal emoji
 
@@ -154,3 +189,88 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     assert "Asking" not in all_content
     # The unrelated terminal tool still renders progress normally.
     assert "pwd" in all_content
+
+
+@pytest.mark.asyncio
+async def test_prequeued_routed_image_reaches_clarify_without_reprompt(monkeypatch, tmp_path):
+    PrequeuedImageClarifyAgent.last_clarify_response = None
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, "off", PrequeuedImageClarifyAgent)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    from tools import clarify_gateway as cm
+
+    monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 1)
+    adapter.gateway_runner = types.SimpleNamespace(
+        _profile_name_for_source=lambda _source: "pilot",
+    )
+    source = adapter.build_source(
+        chat_id="-100123",
+        chat_type="group",
+        user_id="user-1",
+        thread_id="42",
+    )
+    session_key = build_session_key(source, profile=source.profile)
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=source,
+        media_urls=["/tmp/screenshot.jpg"],
+        media_types=["image/jpeg"],
+        message_id="image-before-clarify",
+    )
+
+    result = await runner._run_agent(
+        message="What are these options?",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-prequeued-image",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "received screenshot"
+    assert (
+        PrequeuedImageClarifyAgent.last_clarify_response
+        == "[User sent an image: /tmp/screenshot.jpg]"
+    )
+    assert adapter.get_pending_message(session_key) is None
+    assert not any("Send a screenshot" in item["content"] for item in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_timed_out_prequeued_image_reconciliation_is_cancelled(monkeypatch, tmp_path):
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, "off", OpenEndedClarifyAgent)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    from tools import clarify_gateway as cm
+
+    monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 0.01)
+    original_schedule = gateway_run.safe_schedule_threadsafe
+    reconciliation_future = MagicMock()
+    reconciliation_future.result.side_effect = TimeoutError
+
+    def _schedule(coro, loop, **kwargs):
+        if getattr(getattr(coro, "cr_code", None), "co_name", "") == (
+            "_resolve_prequeued_image_clarify"
+        ):
+            coro.close()
+            return reconciliation_future
+        return original_schedule(coro, loop, **kwargs)
+
+    monkeypatch.setattr(gateway_run, "safe_schedule_threadsafe", _schedule)
+    source = adapter.build_source(chat_id="123", user_id="user-1")
+    session_key = build_session_key(source, profile=source.profile)
+
+    result = await runner._run_agent(
+        message="What are these options?",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-reconciliation-timeout",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "continued"
+    reconciliation_future.cancel.assert_called_once_with()
