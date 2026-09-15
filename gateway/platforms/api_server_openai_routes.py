@@ -651,8 +651,10 @@ class OpenAICompatRoutesMixin:
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
         disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
         from gateway.platforms.api_server import (
-            _abandon_agent_task, _chat_usage_payload, _sse_frame)
+            _abandon_agent_task, _chat_usage_payload, _redact_api_error_text,
+            _resolve_media_to_data_urls, _sse_frame)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+        emitted_text_delta = False
 
         def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
             return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
@@ -667,6 +669,8 @@ class OpenAICompatRoutesMixin:
                     # Custom event: tool lifecycle for frontends without markers in history.
                     await response.write(_sse_frame(delta[1], event="hermes.tool.progress"))
                 else:
+                    if isinstance(delta, str) and delta:
+                        emitted_text_delta = True
                     await response.write(_sse_frame(_chunk({"content": delta})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
@@ -677,12 +681,35 @@ class OpenAICompatRoutesMixin:
                 usage = agent_usage or usage
             except Exception as exc:
                 agent_error = exc
-                logger.error("Agent task %s failed during SSE streaming: %s", completion_id, exc)
+                logger.error(
+                    "Agent task %s failed during SSE streaming: %s",
+                    completion_id,
+                    _redact_api_error_text(exc),
+                )
             completed, is_partial, is_failed, err_msg = _result_flags(result)
+            if err_msg:
+                err_msg = _redact_api_error_text(err_msg)
             if agent_error is not None:
                 is_failed = True
-                err_msg = err_msg or str(agent_error)
-            finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
+                err_msg = err_msg or _redact_api_error_text(agent_error)
+            # Keep this stricter than the shared helper: changing that helper would also alter
+            # non-streaming Chat Completions and the Responses API.
+            if is_partial and err_msg and "truncat" in err_msg.lower():
+                finish_reason = "length"
+            elif agent_error is not None or is_partial or is_failed or not completed or err_msg:
+                finish_reason = "error"
+            else:
+                finish_reason = "stop"
+            final_response = result.get("final_response") if isinstance(result, dict) else None
+            if (
+                finish_reason == "stop"
+                and not emitted_text_delta
+                and isinstance(final_response, str)
+                and final_response
+            ):
+                await response.write(
+                    _sse_frame(_chunk({"content": _resolve_media_to_data_urls(final_response)}))
+                )
             finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             if finish_reason != "stop":
                 if err_msg:

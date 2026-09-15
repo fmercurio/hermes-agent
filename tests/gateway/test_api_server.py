@@ -388,6 +388,49 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+async def _capture_chat_completion_sse(adapter, result, usage, stream_items=()):
+    """Run the real chat-completions writer against an in-memory SSE transport."""
+    from gateway.platforms.api_server import ThreadSafeAsyncQueue
+
+    written = []
+
+    class _CapturingStreamResponse:
+        status = 200
+
+        async def prepare(self, request):
+            return None
+
+        async def write(self, payload):
+            written.append(payload)
+
+    stream_q = ThreadSafeAsyncQueue()
+    for item in stream_items:
+        stream_q.put_nowait(item)
+    stream_q.put_nowait(None)
+
+    async def _synthetic_agent():
+        return result, usage
+
+    agent_task = asyncio.create_task(_synthetic_agent())
+    request = MagicMock()
+    request.headers = {}
+    response = _CapturingStreamResponse()
+    with patch(
+        "gateway.platforms.api_server_openai_routes.web.StreamResponse",
+        return_value=response,
+    ):
+        returned = await adapter._write_sse_chat_completion(
+            request,
+            "chatcmpl-test",
+            "test",
+            1234567890,
+            stream_q,
+            agent_task,
+            agent_ref=[None],
+        )
+    return returned, b"".join(written).decode()
+
+
 class _FakeGoogleChatAdapter:
     def __init__(self, *, verify_ok: bool = True, verify_code: str = ""):
         self.verify_ok = verify_ok
@@ -1131,6 +1174,153 @@ class TestChatCompletionsEndpoint:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+
+    @pytest.mark.parametrize("scenario", ["no_delta", "text_deltas", "progress", "media"])
+    @pytest.mark.asyncio
+    async def test_stream_normal_completion_preserves_final_text_contract(
+        self, adapter, tmp_path, scenario
+    ):
+        """Normal streams emit all final text exactly once, including fallback-only output."""
+        import base64
+
+        usage = {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        expected_content = []
+        final_response = "pong"
+        stream_items = []
+        if scenario == "text_deltas":
+            final_response = "Hello!"
+            expected_content = ["Hello", "!"]
+            stream_items = expected_content
+        elif scenario == "progress":
+            final_response = "tool result"
+            stream_items = [
+                (
+                    "__tool_progress__",
+                    {
+                        "tool": "terminal",
+                        "toolCallId": "call_terminal_1",
+                        "status": "running",
+                    },
+                )
+            ]
+        elif scenario == "media":
+            image_bytes = b"\x89PNG\r\n\x1a\n"
+            image_path = tmp_path / "fallback.png"
+            image_path.write_bytes(image_bytes)
+            final_response = f"MEDIA:{image_path}"
+            expected_content = [
+                "![image](data:image/png;base64,"
+                f"{base64.b64encode(image_bytes).decode()})"
+            ]
+
+        response, body = await _capture_chat_completion_sse(
+            adapter,
+            {"final_response": final_response, "messages": [], "api_calls": 1},
+            usage,
+            stream_items,
+        )
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        chat_chunks = [
+            chunk for chunk in chunks if chunk.get("object") == "chat.completion.chunk"
+        ]
+        content_chunks = [
+            choice["delta"]["content"]
+            for chunk in chat_chunks
+            for choice in chunk["choices"]
+            if choice.get("delta", {}).get("content")
+        ]
+        finish_chunks = [
+            chunk
+            for chunk in chat_chunks
+            if chunk["choices"][0].get("finish_reason") is not None
+        ]
+
+        if scenario != "text_deltas":
+            expected_content = [
+                final_response if scenario != "media" else expected_content[0]
+            ]
+        assert response.status == 200
+        assert chat_chunks[0]["choices"] == [
+            {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+        ]
+        assert content_chunks == expected_content
+        assert ("event: hermes.tool.progress" in body) is (scenario == "progress")
+        assert [chunk["choices"][0]["finish_reason"] for chunk in finish_chunks] == ["stop"]
+        assert finish_chunks[0]["usage"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+        }
+        assert body.endswith("data: [DONE]\n\n")
+
+
+    @pytest.mark.parametrize(
+        ("result_flags", "expected_finish_reason"),
+        [
+            (
+                {"completed": False, "partial": True, "error": "output truncated by provider"},
+                "length",
+            ),
+            ({"completed": True, "partial": True, "error": "partial result"}, "error"),
+            ({"completed": True, "failed": True, "error": "provider failed"}, "error"),
+            ({"completed": True, "error": "provider returned an error"}, "error"),
+            ({"completed": False}, "error"),
+        ],
+        ids=("truncated", "partial", "failed", "error", "incomplete"),
+    )
+    @pytest.mark.asyncio
+    async def test_stream_abnormal_completion_never_emits_success_fallback(
+        self, adapter, result_flags, expected_finish_reason
+    ):
+        """Abnormal final responses stay metadata-only and never look like successful text."""
+        usage = {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+        marker = "ABNORMAL_MUST_NOT_FALL_BACK"
+        response, body = await _capture_chat_completion_sse(
+            adapter,
+            {
+                "final_response": marker,
+                "messages": [],
+                "api_calls": 1,
+                **result_flags,
+            },
+            usage,
+        )
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        finish_chunks = [
+            chunk for chunk in chunks if chunk["choices"][0].get("finish_reason") is not None
+        ]
+
+        assert response.status == 200
+        assert chunks[0]["choices"] == [
+            {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+        ]
+        assert not [
+            choice["delta"]["content"]
+            for chunk in chunks
+            for choice in chunk["choices"]
+            if choice.get("delta", {}).get("content")
+        ]
+        assert marker not in body
+        assert [chunk["choices"][0]["finish_reason"] for chunk in finish_chunks] == [
+            expected_finish_reason
+        ]
+        assert finish_chunks[0]["usage"] == {
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "total_tokens": 3,
+        }
+        assert body.endswith("data: [DONE]\n\n")
 
 
     @pytest.mark.asyncio
